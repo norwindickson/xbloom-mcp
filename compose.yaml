@@ -1,0 +1,82 @@
+name: xbloom-mcp
+
+services:
+  db:
+    image: postgres:17.5-alpine@sha256:316daebee558a40bef03c10817d5589703a8e88dd51c79c9abdb42b22a31d708
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - xbloom_pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    logging: &logging
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  postgrest:
+    image: postgrest/postgrest:v12.2.12@sha256:21d7a459a784fb2c239fd5ec67f4bcb10b1c5b83e9dcf6a79760b3eb44415ef6
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PGRST_DB_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${POSTGREST_JWT_SECRET}
+      PGRST_DB_POOL: 10
+    depends_on:
+      db: {condition: service_healthy}
+    expose: ["3000"]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/3000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    logging: *logging
+
+  mcp:
+    build: {context: ., dockerfile: Dockerfile}
+    image: local/xbloom-mcp:1.0.0
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SUPABASE_REST_URL: http://postgrest:3000
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      SESSION_ENCRYPTION_KEY: ${SESSION_ENCRYPTION_KEY}
+      XBLOOM_MCP_BASE_URL: ${XBLOOM_MCP_BASE_URL}
+    depends_on:
+      postgrest: {condition: service_healthy}
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks: [internal]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: "/tmp:rw,noexec,nosuid,size=16m"
+    healthcheck:
+      test: ["CMD", "deno", "eval", "const r=await fetch('http://127.0.0.1:8000/'); if (!r.ok) Deno.exit(1)"]
+      interval: 15s
+      timeout: 8s
+      retries: 10
+      start_period: 20s
+    logging: *logging
+
+volumes:
+  xbloom_pgdata:
+    name: xbloom-mcp-postgres
+
+networks:
+  internal:
+    name: xbloom-mcp-internal
+    internal: true
