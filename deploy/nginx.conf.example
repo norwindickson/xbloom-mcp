@@ -1,5 +1,14 @@
 # Put this inside the HTTPS server block for mcp.example.com.
-location = /mcp { return 308 /mcp/; }
+location = /mcp {
+    limit_req zone=xbloom_mcp burst=20 nodelay;
+    client_max_body_size 1m;
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+}
 location ^~ /mcp/ {
     limit_req zone=xbloom_mcp burst=20 nodelay;
     client_max_body_size 1m;
@@ -16,5 +25,14 @@ location ^~ /mcp/ {
     proxy_send_timeout 1h;
 }
 
-# Add at http scope if rate limiting is wanted:
+# MCP clients discover OAuth at the origin's .well-known paths, not only /mcp/.
+# Preserve the URI when forwarding (proxy_pass intentionally has no trailing /).
+location ~ ^/\.well-known/(oauth-authorization-server|oauth-protected-resource|openid-configuration)(/mcp)?$ {
+    limit_req zone=xbloom_mcp burst=20 nodelay;
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# Required: add this directive at Nginx http scope (outside the server block):
 # limit_req_zone $binary_remote_addr zone=xbloom_mcp:10m rate=30r/m;

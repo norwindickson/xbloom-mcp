@@ -1,4 +1,4 @@
--- RFC 8628 device authorization state for Hermes CLI OAuth login.
+-- RFC 8628 device authorization state for clients using device login.
 create table if not exists public.oauth_device_codes (
   device_code_hash text primary key,
   user_code text not null unique,

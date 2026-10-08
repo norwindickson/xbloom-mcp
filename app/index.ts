@@ -1114,7 +1114,7 @@ async function updateDeviceStatus(userCode: string, status: "approved" | "denied
 
 function deviceHtml(message = ""): Response {
   const safe = message.replace(/[&<>\"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '\"': "&quot;", "'": "&#39;" }[c]!));
-  return new Response(`<!doctype html><meta name="viewport" content="width=device-width"><title>xBloom MCP authorization</title><style>body{font:16px system-ui;max-width: thirtyrem;max-width:30rem;margin:4rem auto;padding:0 1rem}input,button{font:inherit;padding:.6rem;margin:.3rem 0}button{cursor:pointer}</style><h1>xBloom MCP</h1><p>Hermes is requesting access to this MCP server. Enter the code shown in your terminal.</p>${safe ? `<p>${safe}</p>` : ""}<form method="post"><input name="user_code" autocomplete="one-time-code" placeholder="XXXX-XXXX" required><br><button name="action" value="approve">Approve</button><button name="action" value="deny">Deny</button></form>`, { headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS } });
+  return new Response(`<!doctype html><meta name="viewport" content="width=device-width"><title>xBloom MCP authorization</title><style>body{font:16px system-ui;max-width: thirtyrem;max-width:30rem;margin:4rem auto;padding:0 1rem}input,button{font:inherit;padding:.6rem;margin:.3rem 0}button{cursor:pointer}</style><h1>xBloom MCP</h1><p>An MCP client is requesting access to this server. Enter the code shown in your client.</p>${safe ? `<p>${safe}</p>` : ""}<form method="post"><input name="user_code" autocomplete="one-time-code" placeholder="XXXX-XXXX" required><br><button name="action" value="approve">Approve</button><button name="action" value="deny">Deny</button></form>`, { headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS } });
 }
 
 async function consumeApprovedDeviceCode(deviceCode: string): Promise<{ client_id: string; scope: string | null } | null> {
@@ -1298,7 +1298,7 @@ async function handleDevicePage(req: Request, url: URL): Promise<Response> {
   if (!/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(userCode)) return deviceHtml("Invalid code.");
   if (action !== "approve" && action !== "deny") return deviceHtml("Choose Approve or Deny.");
   const ok = await updateDeviceStatus(userCode, action === "approve" ? "approved" : "denied");
-  return ok ? deviceHtml(action === "approve" ? "Approved. Return to the Hermes terminal." : "Denied.") : deviceHtml("Code expired or not found.");
+  return ok ? deviceHtml(action === "approve" ? "Approved. Return to your MCP client." : "Denied.") : deviceHtml("Code expired or not found.");
 }
 
 async function handleAuthorize(url: URL): Promise<Response> {
@@ -1540,10 +1540,32 @@ function jsonResponse(data: unknown, status = 200) {
 }
 
 function getSessionKey(req: Request): string {
-  // Prefer bearer token (OAuth), fall back to Mcp-Session-Id (authless)
+  // Only an OAuth bearer token may identify an account session.
   const auth = req.headers.get("authorization") || "";
   if (auth.startsWith("Bearer ")) return auth.slice(7);
-  return req.headers.get("mcp-session-id") || "";
+  return "";
+}
+
+async function validAccessToken(token: string): Promise<boolean> {
+  if (!token) return false;
+  const resp = await fetch(
+    `${SUPABASE_REST_URL}/user_sessions?access_token=eq.${encodeURIComponent(token)}&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&select=access_token&limit=1`,
+    { headers: REST_HEADERS },
+  );
+  if (!resp.ok) throw new Error(`OAuth token lookup failed: ${resp.status}`);
+  const rows = await resp.json();
+  return Array.isArray(rows) && rows.length === 1;
+}
+
+function oauthChallenge(): Response {
+  const metadata = new URL("/.well-known/oauth-protected-resource", BASE_URL);
+  return new Response("OAuth authorization required", {
+    status: 401,
+    headers: {
+      "WWW-Authenticate": `Bearer resource_metadata="${metadata}"`,
+      ...CORS_HEADERS,
+    },
+  });
 }
 
 // --- SSE transport ---
@@ -1740,6 +1762,7 @@ Deno.serve(async (req: Request) => {
         response_types_supported: ["code"],
         grant_types_supported: ["authorization_code", "urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
         token_endpoint_auth_methods_supported: [
+          "none",
           "client_secret_post",
           "client_secret_basic",
         ],
@@ -1781,6 +1804,17 @@ Deno.serve(async (req: Request) => {
       response_types: ["code"],
       token_endpoint_auth_method: "client_secret_post",
     });
+  }
+
+  // Require a server-issued bearer token before accepting either transport.
+  // A 401 with protected-resource metadata lets ChatGPT/Claude discover OAuth.
+  const resourcePath = new URL(BASE_URL).pathname.replace(/\/$/, "");
+  if (path === resourcePath || path === `${resourcePath}/` || path.endsWith("/sse") || path.endsWith("/message")) {
+    try {
+      if (!(await validAccessToken(getSessionKey(req)))) return oauthChallenge();
+    } catch {
+      return new Response("Authorization store unavailable", { status: 503 });
+    }
   }
 
   // --- SSE transport ---
@@ -1911,14 +1945,7 @@ Deno.serve(async (req: Request) => {
     return jsonRpcErr(null, -32700, "Parse error");
   }
 
-  // On initialize, generate a session ID if the client doesn't have one (authless).
   const method = body.method as string;
-  let generatedSessionKey = false;
-  if (method === "initialize" && !sessionKey) {
-    sessionKey = generateToken();
-    generatedSessionKey = true;
-  }
-
   const response = await handleMcpMessage(body, sessionKey);
   if (!response) {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -1928,10 +1955,5 @@ Deno.serve(async (req: Request) => {
     "Content-Type": "application/json",
     ...CORS_HEADERS,
   };
-  // Only echo a session id we generated. Never reflect an OAuth bearer token into
-  // Mcp-Session-Id — that would copy the credential into a header proxies/logs keep.
-  if (method === "initialize" && generatedSessionKey) {
-    headers["Mcp-Session-Id"] = sessionKey;
-  }
   return new Response(JSON.stringify(response), { headers });
 });
